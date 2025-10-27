@@ -3,114 +3,83 @@ from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
+import random
 
 app = Flask(__name__)
 
-# -----------------------------
-# Hjälpfunktion: GET med user-agent
-# -----------------------------
-def polite_get(url):
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
-    }
+# --------------------------------------
+# Hjälpfunktion: gör enkel GET-förfrågan
+# --------------------------------------
+def safe_get(url):
     try:
-        r = requests.get(url, headers=headers, timeout=10)
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200:
             return r
     except Exception as e:
-        print("Fel vid GET:", e)
+        print("Request error:", e)
     return None
 
-# -----------------------------
-# Scraper: Vinted
-# -----------------------------
+
+# --------------------------------------
+# Scraper-funktioner
+# --------------------------------------
 def scrape_vinted(query):
-    base_url = "https://www.vinted.se"
-    url = f"{base_url}/sok?q={quote_plus(query)}"
-    r = polite_get(url)
+    base = "https://www.vinted.se"
+    url = f"{base}/sok?q={quote_plus(query)}"
+    r = safe_get(url)
     if not r:
         return []
-
     soup = BeautifulSoup(r.text, "html.parser")
-    results = []
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-        if "/items/" in href:
-            results.append(requests.compat.urljoin(base_url, href))
-    return results[:5]
+    links = [a.get("href") for a in soup.select("a") if a.get("href") and "/items/" in a.get("href")]
+    return [base + l for l in links[:3]]
 
-# -----------------------------
-# Scraper: Sellpy
-# -----------------------------
+
 def scrape_sellpy(query):
-    base_url = "https://www.sellpy.se/sok"
-    url = f"{base_url}?q={quote_plus(query)}"
-    r = polite_get(url)
+    base = "https://www.sellpy.se"
+    url = f"{base}/sok?q={quote_plus(query)}"
+    r = safe_get(url)
     if not r:
         return []
-
     soup = BeautifulSoup(r.text, "html.parser")
-    results = []
-    for link in soup.find_all("a", href=True):
-        if "/produkt/" in link["href"]:
-            results.append(requests.compat.urljoin("https://www.sellpy.se", link["href"]))
-    return results[:5]
+    links = [a.get("href") for a in soup.select("a") if a.get("href") and "/products/" in a.get("href")]
+    return [base + l for l in links[:3]]
 
-# -----------------------------
-# Scraper: Tradera
-# -----------------------------
+
 def scrape_tradera(query):
-    base_url = "https://www.tradera.com/sok"
-    url = f"{base_url}?q={quote_plus(query)}"
-    r = polite_get(url)
+    base = "https://www.tradera.com"
+    url = f"{base}/sok?q={quote_plus(query)}"
+    r = safe_get(url)
     if not r:
         return []
-
     soup = BeautifulSoup(r.text, "html.parser")
-    results = []
-    for link in soup.find_all("a", href=True):
-        if "/item/" in link["href"]:
-            results.append(requests.compat.urljoin(base_url, link["href"]))
-    return results[:5]
+    links = [a.get("href") for a in soup.select("a") if a.get("href") and "/item/" in a.get("href")]
+    return [base + l for l in links[:3]]
 
-# -----------------------------
-# Scraper: Plick
-# -----------------------------
+
 def scrape_plick(query):
-    base_url = "https://plick.se/sok"
-    url = f"{base_url}?q={quote_plus(query)}"
-    r = polite_get(url)
+    base = "https://plick.se"
+    url = f"{base}/sok?q={quote_plus(query)}"
+    r = safe_get(url)
     if not r:
         return []
-
     soup = BeautifulSoup(r.text, "html.parser")
-    results = []
-    for link in soup.find_all("a", href=True):
-        if "/p/" in link["href"]:
-            results.append(requests.compat.urljoin("https://plick.se", link["href"]))
-    return results[:5]
+    links = [a.get("href") for a in soup.select("a") if a.get("href") and "/p/" in a.get("href")]
+    return [base + l for l in links[:3]]
 
-# -----------------------------
-# Rankering: välj mest relevant länk
-# -----------------------------
-def rank_results(all_results, query):
-    query_words = query.lower().split()
-    scored = []
-    for url in all_results:
-        score = sum(word in url.lower() for word in query_words)
-        scored.append((score, url))
-    scored.sort(reverse=True)
-    if scored:
-        return scored[0][1]
-    return None
 
-# -----------------------------
+# --------------------------------------
+# Enkel "ranking" – ta första rimliga länk
+# --------------------------------------
+def rank_results(results, query):
+    if not results:
+        return None
+    # slumpa bland toppresultaten för test
+    return random.choice(results[:3])
+
+
+# --------------------------------------
 # /search endpoint
-# -----------------------------
+# --------------------------------------
 @app.route("/search", methods=["POST"])
 def search():
     data = request.get_json() or {}
@@ -118,24 +87,25 @@ def search():
     brand = data.get("brand", "")
     size = data.get("size", "")
     color = data.get("color", "")
-    price_min = data.get("price_min", "")
-    price_max = data.get("price_max", "")
     condition = data.get("condition", "")
 
-    # Kombinera till söksträng
+    # Gör en bred söksträng
     query_parts = [brand, category, size, color, condition]
     query = " ".join([p for p in query_parts if p])
 
-    # Samla resultat från alla sidor
+    # Samla resultat
     all_results = []
     all_results += scrape_vinted(query)
-    all_results += scrape_sellpy(query)
-    all_results += scrape_tradera(query)
-    all_results += scrape_plick(query)
+    if not all_results:
+        all_results += scrape_sellpy(query)
+    if not all_results:
+        all_results += scrape_tradera(query)
+    if not all_results:
+        all_results += scrape_plick(query)
 
     best_link = rank_results(all_results, query)
 
-    # --- alltid returnera 'best_match_link' som text ---
+    # Returnera alltid JSON med båda fält
     if not best_link:
         return jsonify({
             "status": "no_results",
@@ -147,9 +117,9 @@ def search():
         "best_match_link": best_link
     })
 
-# -----------------------------
+
+# --------------------------------------
 # Flask start
-# -----------------------------
+# --------------------------------------
 if __name__ == "__main__":
     app.run(debug=True)
-
