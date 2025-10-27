@@ -1,83 +1,46 @@
 # app.py
 from flask import Flask, request, jsonify
 import requests
-from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
 
 app = Flask(__name__)
 
 # -----------------------------
-# Hjälpfunktion: säker GET-request
+# Funktion: Sök på Vinted
 # -----------------------------
-def polite_get(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
+def search_vinted(category, brand, size, color, condition):
+    """
+    Söker produkter på Vinted via deras API.
+    Returnerar en lista med (titel, pris, länk).
+    """
+    base_url = "https://www.vinted.se/api/v2/catalog/items"
+    params = {
+        "search_text": " ".join(filter(None, [brand, category, size, color])),
+        "status": "used" if condition.lower() == "begagnad" else "new",
+        "per_page": 10
+    }
+
     try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            return r
+        r = requests.get(base_url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        results = []
+        for item in data.get("items", []):
+            title = item.get("title", "")
+            price = item.get("price_cents", 0) / 100
+            link = f"https://www.vinted.se/items/{item.get('id')}"
+            results.append({"title": title, "price": price, "link": link})
+
+        # Sortera efter lägsta pris
+        results.sort(key=lambda x: x["price"])
+        return results
+
     except Exception as e:
-        print("Request error:", e)
-    return None
+        print("Fel vid Vinted-anrop:", e)
+        return []
 
 # -----------------------------
-# Scraperfunktioner för varje plattform
-# -----------------------------
-def scrape_vinted(query):
-    base_url = "https://www.vinted.se"
-    url = f"{base_url}/sok?q={quote_plus(query)}"
-    r = polite_get(url)
-    results = []
-    if not r:
-        return results
-    soup = BeautifulSoup(r.text, "html.parser")
-    products = soup.select("a.product-card")
-    for p in products[:5]:
-        href = p.get("href")
-        if href:
-            results.append(requests.compat.urljoin(base_url, href))
-    return results
-
-def scrape_sellpy(query):
-    base_url = "https://www.sellpy.se/sok?q="
-    url = f"{base_url}{quote_plus(query)}"
-    r = polite_get(url)
-    results = []
-    if not r:
-        return results
-    soup = BeautifulSoup(r.text, "html.parser")
-    products = soup.select("a.product-card")
-    for p in products[:5]:
-        href = p.get("href")
-        if href:
-            results.append(requests.compat.urljoin("https://www.sellpy.se", href))
-    return results
-
-def scrape_tradera(query):
-    base_url = "https://www.tradera.com/sok?q="
-    url = f"{base_url}{quote_plus(query)}"
-    r = polite_get(url)
-    results = []
-    if not r:
-        return results
-    soup = BeautifulSoup(r.text, "html.parser")
-    products = soup.select("a.search-result-item")
-    for p in products[:5]:
-        href = p.get("href")
-        if href:
-            results.append(requests.compat.urljoin("https://www.tradera.com", href))
-    return results
-
-# -----------------------------
-# Rankning av resultat: returnerar första match
-# -----------------------------
-def rank_results(all_results, query):
-    if not all_results:
-        return None
-    # Enklaste logiken: första resultat är mest relevant
-    return all_results[0]
-
-# -----------------------------
-# /search endpoint
+# Flask endpoint /search
 # -----------------------------
 @app.route("/search", methods=["POST"])
 def search():
@@ -88,38 +51,24 @@ def search():
     color = data.get("color", "")
     condition = data.get("condition", "")
 
-    # Kombinera filter till söksträng
-    query_parts = [brand, category, size, color, condition]
-    query = " ".join([p for p in query_parts if p])
+    results = search_vinted(category, brand, size, color, condition)
 
-    all_results = []
-
-    # --- 1️⃣ Vinted ---
-    all_results += scrape_vinted(query)
-
-    # --- 2️⃣ Sellpy fallback ---
-    if not all_results:
-        all_results += scrape_sellpy(query)
-
-    # --- 3️⃣ Tradera fallback ---
-    if not all_results:
-        all_results += scrape_tradera(query)
-
-    # --- Rankning ---
-    best_link = rank_results(all_results, query)
-
-    # --- Returnera JSON för Adalo ---
-    if not best_link:
+    if not results:
         return jsonify({
             "status": "no_results",
-            "best_match_link": "",
-            "results": []
-        }), 404
+            "title": "",
+            "price": "",
+            "best_match_link": ""
+        })
+
+    # Välj billigaste/mest relevanta
+    best = results[0]
 
     return jsonify({
         "status": "success",
-        "best_match_link": best_link,
-        "results": all_results
+        "title": best["title"],
+        "price": best["price"],
+        "best_match_link": best["link"]
     })
 
 # -----------------------------
