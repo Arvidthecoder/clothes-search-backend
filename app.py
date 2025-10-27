@@ -7,7 +7,7 @@ from urllib.parse import quote_plus
 app = Flask(__name__)
 
 # -----------------------------
-# Hjälpfunktion: polite_get (säker request)
+# Hjälpfunktion: säker GET-request
 # -----------------------------
 def polite_get(url):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -20,18 +20,18 @@ def polite_get(url):
     return None
 
 # -----------------------------
-# Scraperfunktioner (plats för framtida)
+# Scraperfunktioner för varje plattform
 # -----------------------------
 def scrape_vinted(query):
     base_url = "https://www.vinted.se"
     url = f"{base_url}/sok?q={quote_plus(query)}"
     r = polite_get(url)
+    results = []
     if not r:
-        return []
+        return results
     soup = BeautifulSoup(r.text, "html.parser")
     products = soup.select("a.product-card")
-    results = []
-    for p in products[:3]:
+    for p in products[:5]:
         href = p.get("href")
         if href:
             results.append(requests.compat.urljoin(base_url, href))
@@ -41,12 +41,12 @@ def scrape_sellpy(query):
     base_url = "https://www.sellpy.se/sok?q="
     url = f"{base_url}{quote_plus(query)}"
     r = polite_get(url)
+    results = []
     if not r:
-        return []
+        return results
     soup = BeautifulSoup(r.text, "html.parser")
     products = soup.select("a.product-card")
-    results = []
-    for p in products[:3]:
+    for p in products[:5]:
         href = p.get("href")
         if href:
             results.append(requests.compat.urljoin("https://www.sellpy.se", href))
@@ -56,19 +56,28 @@ def scrape_tradera(query):
     base_url = "https://www.tradera.com/sok?q="
     url = f"{base_url}{quote_plus(query)}"
     r = polite_get(url)
+    results = []
     if not r:
-        return []
+        return results
     soup = BeautifulSoup(r.text, "html.parser")
     products = soup.select("a.search-result-item")
-    results = []
-    for p in products[:3]:
+    for p in products[:5]:
         href = p.get("href")
         if href:
             results.append(requests.compat.urljoin("https://www.tradera.com", href))
     return results
 
 # -----------------------------
-# /search endpoint (setup version för Adalo)
+# Rankning av resultat: returnerar första match
+# -----------------------------
+def rank_results(all_results, query):
+    if not all_results:
+        return None
+    # Enklaste logiken: första resultat är mest relevant
+    return all_results[0]
+
+# -----------------------------
+# /search endpoint
 # -----------------------------
 @app.route("/search", methods=["POST"])
 def search():
@@ -79,19 +88,38 @@ def search():
     color = data.get("color", "")
     condition = data.get("condition", "")
 
-    # Kombinera till söksträng
+    # Kombinera filter till söksträng
     query_parts = [brand, category, size, color, condition]
     query = " ".join([p for p in query_parts if p])
 
-    # --- Här kommer testdata för att Adalo ska känna igen outputs ---
+    all_results = []
+
+    # --- 1️⃣ Vinted ---
+    all_results += scrape_vinted(query)
+
+    # --- 2️⃣ Sellpy fallback ---
+    if not all_results:
+        all_results += scrape_sellpy(query)
+
+    # --- 3️⃣ Tradera fallback ---
+    if not all_results:
+        all_results += scrape_tradera(query)
+
+    # --- Rankning ---
+    best_link = rank_results(all_results, query)
+
+    # --- Returnera JSON för Adalo ---
+    if not best_link:
+        return jsonify({
+            "status": "no_results",
+            "best_match_link": "",
+            "results": []
+        }), 404
+
     return jsonify({
         "status": "success",
-        "best_match_link": "https://example.com/test-product",
-        "results": [
-            "https://example.com/test1",
-            "https://example.com/test2",
-            "https://example.com/test3"
-        ]
+        "best_match_link": best_link,
+        "results": all_results
     })
 
 # -----------------------------
