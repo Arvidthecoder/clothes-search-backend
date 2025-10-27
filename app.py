@@ -103,11 +103,11 @@ def search():
 
     best_link = rank_results(all_results, query)
 
-    # --- Viktigt: Adalo måste se fältet best_match_link vid setup-test ---
+    # --- Returnera resultat ---
     if not best_link:
         return jsonify({
             "status": "no_results",
-            "best_match_link": "https://example.com/test-product"  # testlänk så Adalo hittar output
+            "best_match_link": ""
         })
 
     return jsonify({
