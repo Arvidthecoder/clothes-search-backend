@@ -3,12 +3,11 @@ from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus
-import time
 
 app = Flask(__name__)
 
 # -----------------------------
-# Hjälpfunktion: säkra GET-anrop
+# Hjälpfunktion: GET med user-agent
 # -----------------------------
 def polite_get(url):
     headers = {
@@ -25,7 +24,6 @@ def polite_get(url):
     except Exception as e:
         print("Fel vid GET:", e)
     return None
-
 
 # -----------------------------
 # Scraper: Vinted
@@ -45,7 +43,6 @@ def scrape_vinted(query):
             results.append(requests.compat.urljoin(base_url, href))
     return results[:5]
 
-
 # -----------------------------
 # Scraper: Sellpy
 # -----------------------------
@@ -62,7 +59,6 @@ def scrape_sellpy(query):
         if "/produkt/" in link["href"]:
             results.append(requests.compat.urljoin("https://www.sellpy.se", link["href"]))
     return results[:5]
-
 
 # -----------------------------
 # Scraper: Tradera
@@ -81,7 +77,6 @@ def scrape_tradera(query):
             results.append(requests.compat.urljoin(base_url, link["href"]))
     return results[:5]
 
-
 # -----------------------------
 # Scraper: Plick
 # -----------------------------
@@ -99,15 +94,10 @@ def scrape_plick(query):
             results.append(requests.compat.urljoin("https://plick.se", link["href"]))
     return results[:5]
 
-
 # -----------------------------
-# Ranking: välj mest relevant länk
+# Rankering: välj mest relevant länk
 # -----------------------------
 def rank_results(all_results, query):
-    """
-    Sorterar resultat efter enkel "relevanspoäng".
-    Poäng ges om ord i query matchar länktext eller href.
-    """
     query_words = query.lower().split()
     scored = []
     for url in all_results:
@@ -115,9 +105,8 @@ def rank_results(all_results, query):
         scored.append((score, url))
     scored.sort(reverse=True)
     if scored:
-        return scored[0][1]  # mest relevant
+        return scored[0][1]
     return None
-
 
 # -----------------------------
 # /search endpoint
@@ -137,9 +126,7 @@ def search():
     query_parts = [brand, category, size, color, condition]
     query = " ".join([p for p in query_parts if p])
 
-    print("🔍 Sökfråga:", query)
-
-    # Samla resultat från flera sidor
+    # Samla resultat från alla sidor
     all_results = []
     all_results += scrape_vinted(query)
     all_results += scrape_sellpy(query)
@@ -148,20 +135,21 @@ def search():
 
     best_link = rank_results(all_results, query)
 
+    # --- alltid returnera 'best_match_link' som text ---
     if not best_link:
         return jsonify({
-            "best_match_link": None,
-            "status": "no_results"
+            "status": "no_results",
+            "best_match_link": ""
         })
 
     return jsonify({
-        "best_match_link": best_link,
-        "status": "success"
+        "status": "success",
+        "best_match_link": best_link
     })
-
 
 # -----------------------------
 # Flask start
 # -----------------------------
 if __name__ == "__main__":
     app.run(debug=True)
+
