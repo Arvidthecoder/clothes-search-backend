@@ -6,18 +6,25 @@ import re
 app = Flask(__name__)
 
 # --------------------------------------------
-# Hjälpfunktioner för smart sökning
+# Hjälpfunktioner – språkförståelse & ranking
 # --------------------------------------------
 def normalize_query(text):
-    """Förenkla text (t.ex. 'baggy jeans' -> 'wide jeans')."""
+    """
+    Gör sökningen smartare:
+    Lägger till synonymer så att 'baggy jeans' även hittar 'loose fit jeans'.
+    """
     synonyms = {
         "baggy": ["wide", "loose", "relaxed"],
         "grisch": ["grey", "streetwear"],
         "oversized": ["loose", "relaxed"],
         "jacka": ["jacket", "coat"],
         "tröja": ["sweater", "hoodie", "shirt"],
-        "byxor": ["pants", "trousers", "jeans"]
+        "byxor": ["pants", "trousers", "jeans"],
+        "jeans": ["denim"],
+        "skor": ["shoes", "sneakers", "boots"],
+        "vintage": ["retro", "oldschool"]
     }
+
     text = text.lower()
     for key, words in synonyms.items():
         if key in text:
@@ -25,8 +32,17 @@ def normalize_query(text):
     return text
 
 
+def parse_price(price_str):
+    """Försöker hitta ett numeriskt pris i en text, t.ex. '299 kr' -> 299."""
+    match = re.findall(r"\d+", str(price_str))
+    return float(match[0]) if match else 999999
+
+
 def rank_results(results, query):
-    """Välj mest relevant och billigast produkt."""
+    """
+    Rankar resultat baserat på hur många ord i titeln matchar sökningen
+    och vilket pris som är lägst.
+    """
     if not results:
         return None
 
@@ -36,7 +52,7 @@ def rank_results(results, query):
         title = item.get("title", "").lower()
         title_words = set(re.findall(r"\w+", title))
         common = len(query_words & title_words)
-        price = float(item.get("price", 999999)) if str(item.get("price", "")).isdigit() else 999999
+        price = parse_price(item.get("price", ""))
         return (-common, price)
 
     results.sort(key=score)
@@ -44,7 +60,7 @@ def rank_results(results, query):
 
 
 # --------------------------------------------
-# Scrapers
+# Scrapers för varje plattform
 # --------------------------------------------
 def fetch_vinted(query):
     """Vinted API."""
@@ -60,7 +76,8 @@ def fetch_vinted(query):
                 "title": item.get("title", "okänd produkt"),
                 "price": item.get("price_numeric", ""),
                 "image": item.get("photo", {}).get("url", ""),
-                "link": f"https://www.vinted.se/items/{item.get('id')}"
+                "link": f"https://www.vinted.se/items/{item.get('id')}",
+                "site": "vinted"
             })
         return results
     except Exception as e:
@@ -89,7 +106,8 @@ def fetch_sellpy(query):
                 "title": titles[i] if i < len(titles) else "Sellpy-produkt",
                 "price": prices[i] if i < len(prices) else "",
                 "image": images[i] if i < len(images) else "",
-                "link": f"https://www.sellpy.se{links[i]}"
+                "link": f"https://www.sellpy.se{links[i]}",
+                "site": "sellpy"
             })
         return results
     except Exception as e:
@@ -118,7 +136,8 @@ def fetch_tradera(query):
                 "title": titles[i] if i < len(titles) else "Tradera-produkt",
                 "price": prices[i] if i < len(prices) else "",
                 "image": images[i] if i < len(images) else "",
-                "link": f"https://www.tradera.com{links[i]}"
+                "link": f"https://www.tradera.com{links[i]}",
+                "site": "tradera"
             })
         return results
     except Exception as e:
@@ -126,51 +145,94 @@ def fetch_tradera(query):
         return []
 
 
+def fetch_plick(query):
+    """Plick HTML-parser."""
+    try:
+        base_url = "https://plick.se/sok"
+        url = f"{base_url}?q={quote_plus(query)}"
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            return []
+        text = r.text
+
+        titles = re.findall(r'<h2[^>]*>(.*?)</h2>', text)
+        links = re.findall(r'href="(/item/[^"]+)"', text)
+        images = re.findall(r'src="(https://[^"]+\.jpg)"', text)
+        prices = re.findall(r'(\d+)\s*kr', text)
+
+        results = []
+        for i in range(min(len(links), 5)):
+            results.append({
+                "title": titles[i] if i < len(titles) else "Plick-produkt",
+                "price": prices[i] if i < len(prices) else "",
+                "image": images[i] if i < len(images) else "",
+                "link": f"https://plick.se{links[i]}",
+                "site": "plick"
+            })
+        return results
+    except Exception as e:
+        print("Plick error:", e)
+        return []
+
+
 # --------------------------------------------
-# Flask endpoint
+# Flask endpoints
 # --------------------------------------------
 @app.route("/search", methods=["POST"])
 def search():
+    """
+    Huvudfunktionen – tar emot data från Adalo,
+    söker på flera sajter, filtrerar, rankar och returnerar bästa produkten.
+    """
     try:
         data = request.get_json(force=True)
     except Exception as e:
         return jsonify({"status": "error", "reason": f"Invalid JSON: {e}"}), 400
 
-    # Hämta filter
+    # Filtrera baserat på input
     category = data.get("category", "")
     brand = data.get("brand", "")
     size = data.get("size", "")
     color = data.get("color", "")
     condition = data.get("condition", "")
+    min_price = float(data.get("min_price", 0))
+    max_price = float(data.get("max_price", 999999))
+
+    # Bygg sökfråga
     query = " ".join(filter(None, [brand, category, size, color, condition]))
     query = normalize_query(query)
 
-    all_results = fetch_vinted(query)
-    if not all_results:
-        all_results = fetch_sellpy(query)
-    if not all_results:
-        all_results = fetch_tradera(query)
+    # Hämta från flera källor
+    all_results = fetch_vinted(query) + fetch_sellpy(query) + fetch_tradera(query) + fetch_plick(query)
 
-    best = rank_results(all_results, query)
+    # Filtrera bort onödiga priser
+    filtered = []
+    for item in all_results:
+        price = parse_price(item.get("price", ""))
+        if min_price <= price <= max_price:
+            filtered.append(item)
+
+    best = rank_results(filtered or all_results, query)
 
     if not best:
         return jsonify({
             "status": "no_results",
-            "title": "",
-            "price": "",
-            "image": "",
-            "best_match_link": "",
+            "query": query,
+            "best": {},
             "results": []
         })
 
     return jsonify({
         "status": "success",
-        "title": best["title"],
-        "price": best["price"],
-        "image": best["image"],
-        "best_match_link": best["link"],
-        "results": all_results
+        "query": query,
+        "best": best,
+        "results_count": len(filtered or all_results)
     })
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
 
 if __name__ == "__main__":
