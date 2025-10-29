@@ -1,239 +1,344 @@
+# main.py
+# ClothesFinder — Flask API that scrapes multiple marketplaces and returns the best matching product.
+# IMPORTANT: scraping selectors can break if sites change. Use official APIs where available.
+# Designed for Render/Gunicorn; binds to 0.0.0.0:10000 so Render detects the port.
+
 from flask import Flask, request, jsonify
 import requests
-from urllib.parse import quote_plus
+from bs4 import BeautifulSoup
+import concurrent.futures
+import time
 import re
+import threading
 
 app = Flask(__name__)
 
-# --------------------------------------------
-# Hjälpfunktioner – språkförståelse & ranking
-# --------------------------------------------
-def normalize_query(text):
-    """
-    Gör sökningen smartare:
-    Lägger till synonymer så att 'baggy jeans' även hittar 'loose fit jeans'.
-    """
-    synonyms = {
-        "baggy": ["wide", "loose", "relaxed"],
-        "grisch": ["grey", "streetwear"],
-        "oversized": ["loose", "relaxed"],
-        "jacka": ["jacket", "coat"],
-        "tröja": ["sweater", "hoodie", "shirt"],
-        "byxor": ["pants", "trousers", "jeans"],
-        "jeans": ["denim"],
-        "skor": ["shoes", "sneakers", "boots"],
-        "vintage": ["retro", "oldschool"]
-    }
+# --- CONFIG ---
+USER_AGENT = "Mozilla/5.0 (compatible; ClothesFinder/1.0; +https://example.com)"
+REQUEST_TIMEOUT = 8  # seconds
+MAX_WORKERS = 6
+CACHE_TTL = 300  # seconds
 
-    text = text.lower()
-    for key, words in synonyms.items():
-        if key in text:
-            text += " " + " ".join(words)
-    return text
+# List of sites (modular). Add more entries to expand.
+# Each entry is (site_name, scraper_function)
+# Scraper functions are defined below.
+sites = []
 
+# --- Simple in-memory cache ---
+_cache = {}
+_cache_lock = threading.Lock()
 
-def parse_price(price_str):
-    """Försöker hitta ett numeriskt pris i en text, t.ex. '299 kr' -> 299."""
-    match = re.findall(r"\d+", str(price_str))
-    return float(match[0]) if match else 999999
+def cache_get(key):
+    with _cache_lock:
+        item = _cache.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if time.time() - ts > CACHE_TTL:
+            del _cache[key]
+            return None
+        return value
 
+def cache_set(key, value):
+    with _cache_lock:
+        _cache[key] = (time.time(), value)
 
-def rank_results(results, query):
-    """
-    Rankar resultat baserat på hur många ord i titeln matchar sökningen
-    och vilket pris som är lägst.
-    """
-    if not results:
+# --- Helper utilities ---
+def clean_text(t):
+    if not t:
+        return ""
+    return re.sub(r'\s+', ' ', t).strip()
+
+def parse_price(text):
+    if not text:
+        return None
+    # Extract numbers like 1 299, 1299, 1299.00
+    m = re.search(r'(\d+[ \d\.]*\d)', text.replace('\u00A0',' '))
+    if not m:
+        return None
+    num = m.group(1)
+    num = num.replace(' ', '').replace('.', '').replace(',', '')
+    try:
+        return int(num)
+    except:
+        try:
+            return float(num)
+        except:
+            return None
+
+def http_get(url, params=None):
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:
+        # Could log here
         return None
 
-    query_words = set(query.lower().split())
+# --- Site-specific scraper implementations ---
+# NOTE: CSS selectors may need adjustments. These implementations try to be defensive and generic.
 
-    def score(item):
-        title = item.get("title", "").lower()
-        title_words = set(re.findall(r"\w+", title))
-        common = len(query_words & title_words)
-        price = parse_price(item.get("price", ""))
-        return (-common, price)
-
-    results.sort(key=score)
-    return results[0]
-
-
-# --------------------------------------------
-# Scrapers för varje plattform
-# --------------------------------------------
-def fetch_vinted(query):
-    """Vinted API."""
-    try:
-        url = f"https://www.vinted.se/api/v2/catalog/items?q={quote_plus(query)}"
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("items", [])
-        results = []
-        for item in items[:10]:
-            results.append({
-                "title": item.get("title", "okänd produkt"),
-                "price": item.get("price_numeric", ""),
-                "image": item.get("photo", {}).get("url", ""),
-                "link": f"https://www.vinted.se/items/{item.get('id')}",
-                "site": "vinted"
-            })
+def search_vinted(query, filters):
+    """Search Vinted and return list of dicts {title, price, url, used?}"""
+    results = []
+    q = requests.utils.quote(query)
+    url = f"https://www.vinted.se/catalog?search_text={q}"
+    html = http_get(url)
+    if not html:
         return results
-    except Exception as e:
-        print("Vinted error:", e)
-        return []
+    soup = BeautifulSoup(html, "html.parser")
+    # Vinted structure: links with class like 'catalog-item__link', fallback to 'a' with '/item/'
+    anchors = soup.select("a.catalog-item__link")
+    if not anchors:
+        anchors = [a for a in soup.find_all("a", href=True) if "/item/" in a.get("href", "")]
+    for a in anchors[:12]:
+        href = a.get("href")
+        if href and href.startswith("/"):
+            link = "https://www.vinted.se" + href
+        else:
+            link = href
+        title = clean_text(a.get_text() or a.get("title") or "")
+        price_tag = a.select_one(".catalog-item__price") if a else None
+        price_text = price_tag.get_text() if price_tag else ""
+        price = parse_price(price_text)
+        results.append({"site":"Vinted", "title": title, "price": price, "url": link, "used": True})
+    return results
 
-
-def fetch_sellpy(query):
-    """Sellpy HTML-parser."""
-    try:
-        base_url = "https://www.sellpy.se/sok"
-        url = f"{base_url}?q={quote_plus(query)}"
-        r = requests.get(url, timeout=8)
-        if r.status_code != 200:
-            return []
-        text = r.text
-
-        titles = re.findall(r'<h2[^>]*>(.*?)</h2>', text)
-        links = re.findall(r'href="(/produkt/[^"]+)"', text)
-        images = re.findall(r'src="(https://[^"]+\.jpg)"', text)
-        prices = re.findall(r'(\d+)\s*kr', text)
-
-        results = []
-        for i in range(min(len(links), 5)):
-            results.append({
-                "title": titles[i] if i < len(titles) else "Sellpy-produkt",
-                "price": prices[i] if i < len(prices) else "",
-                "image": images[i] if i < len(images) else "",
-                "link": f"https://www.sellpy.se{links[i]}",
-                "site": "sellpy"
-            })
+def search_tradera(query, filters):
+    results = []
+    q = requests.utils.quote(query)
+    url = f"https://www.tradera.com/search?q={q}"
+    html = http_get(url)
+    if not html:
         return results
-    except Exception as e:
-        print("Sellpy error:", e)
-        return []
+    soup = BeautifulSoup(html, "html.parser")
+    # Try typical listing link classes
+    anchors = soup.select("a.listing-card__link")
+    if not anchors:
+        anchors = [a for a in soup.find_all("a", href=True) if "/item/" in a.get("href", "")]
+    for a in anchors[:12]:
+        href = a.get("href")
+        link = href if href.startswith("http") else "https://www.tradera.com" + href
+        title = clean_text(a.get_text() or a.get("title") or "")
+        price_tag = a.select_one(".listing-card__price")
+        price_text = price_tag.get_text() if price_tag else ""
+        price = parse_price(price_text)
+        results.append({"site":"Tradera", "title": title, "price": price, "url": link, "used": True})
+    return results
 
-
-def fetch_tradera(query):
-    """Tradera HTML-parser."""
-    try:
-        base_url = "https://www.tradera.com/sok"
-        url = f"{base_url}?q={quote_plus(query)}"
-        r = requests.get(url, timeout=8)
-        if r.status_code != 200:
-            return []
-        text = r.text
-
-        titles = re.findall(r'alt="([^"]+)"', text)
-        links = re.findall(r'href="(/item/[^"]+)"', text)
-        prices = re.findall(r'(\d+)\s*kr', text)
-        images = re.findall(r'src="(https://[^"]+\.jpg)"', text)
-
-        results = []
-        for i in range(min(len(links), 5)):
-            results.append({
-                "title": titles[i] if i < len(titles) else "Tradera-produkt",
-                "price": prices[i] if i < len(prices) else "",
-                "image": images[i] if i < len(images) else "",
-                "link": f"https://www.tradera.com{links[i]}",
-                "site": "tradera"
-            })
+def search_blocket(query, filters):
+    results = []
+    q = requests.utils.quote(query)
+    url = f"https://www.blocket.se/annonser/hela_sverige?q={q}"
+    html = http_get(url)
+    if not html:
         return results
-    except Exception as e:
-        print("Tradera error:", e)
-        return []
+    soup = BeautifulSoup(html, "html.parser")
+    anchors = soup.select("a.AdItem_link__")  # fallback; may not match
+    if not anchors:
+        anchors = [a for a in soup.find_all("a", href=True) if "/annons/" in a.get("href","")]
+    for a in anchors[:12]:
+        href = a.get("href")
+        link = href if href.startswith("http") else "https://www.blocket.se" + href
+        title = clean_text(a.get_text() or a.get("title") or "")
+        # blocket price parse heuristics
+        parent_text = a.parent.get_text() if a.parent else ""
+        price = parse_price(parent_text)
+        results.append({"site":"Blocket", "title": title, "price": price, "url": link, "used": True})
+    return results
 
-
-def fetch_plick(query):
-    """Plick HTML-parser."""
-    try:
-        base_url = "https://plick.se/sok"
-        url = f"{base_url}?q={quote_plus(query)}"
-        r = requests.get(url, timeout=8)
-        if r.status_code != 200:
-            return []
-        text = r.text
-
-        titles = re.findall(r'<h2[^>]*>(.*?)</h2>', text)
-        links = re.findall(r'href="(/item/[^"]+)"', text)
-        images = re.findall(r'src="(https://[^"]+\.jpg)"', text)
-        prices = re.findall(r'(\d+)\s*kr', text)
-
-        results = []
-        for i in range(min(len(links), 5)):
-            results.append({
-                "title": titles[i] if i < len(titles) else "Plick-produkt",
-                "price": prices[i] if i < len(prices) else "",
-                "image": images[i] if i < len(images) else "",
-                "link": f"https://plick.se{links[i]}",
-                "site": "plick"
-            })
+def search_generic_store(query, filters, base_url, product_path_contains=None):
+    # Generic fallback: fetch base_url + search param and find product anchors
+    results = []
+    q = requests.utils.quote(query)
+    url = base_url + q
+    html = http_get(url)
+    if not html:
         return results
-    except Exception as e:
-        print("Plick error:", e)
-        return []
+    soup = BeautifulSoup(html, "html.parser")
+    anchors = soup.find_all("a", href=True)
+    for a in anchors[:30]:
+        href = a.get("href")
+        if not href:
+            continue
+        if product_path_contains and product_path_contains not in href:
+            continue
+        link = href if href.startswith("http") else base_url.split('?')[0].rstrip('/') + href
+        title = clean_text(a.get_text() or a.get("title") or "")
+        # Attempt to find price near anchor
+        price = None
+        # sibling/parent search
+        for p in (a.parent, a.parent.parent if a.parent else None):
+            if p:
+                price = parse_price(p.get_text())
+                if price:
+                    break
+        results.append({"site": base_url.split("//")[1].split("/")[0], "title": title, "price": price, "url": link, "used": False})
+    return results
 
+# Register scrapers
+sites = [
+    ("Vinted", search_vinted),
+    ("Tradera", search_tradera),
+    ("Blocket", search_blocket),
+    # Example generic stores (can add many)
+    ("Zalando", lambda q, f: search_generic_store(q, f, "https://www.zalando.se/catalog/?q=")),
+    ("Amazon_se", lambda q, f: search_generic_store(q, f, "https://www.amazon.se/s?k=")),
+    # add more as needed ...
+]
 
-# --------------------------------------------
-# Flask endpoints
-# --------------------------------------------
-@app.route("/search", methods=["POST"])
-def search():
+# --- Scoring logic ---
+def score_product(prod, filters):
     """
-    Huvudfunktionen – tar emot data från Adalo,
-    söker på flera sajter, filtrerar, rankar och returnerar bästa produkten.
+    Compute a score for a product dict based on filters.
+    Higher = better.
     """
+    score = 0
+    title = (prod.get("title") or "").lower()
+    brand = (filters.get("brand") or "").lower()
+    item = (filters.get("item") or "").lower()
+    size = (filters.get("size") or "").lower()
+    color = (filters.get("color") or "").lower()
+    price_max = filters.get("price_max")
+    used_filter = filters.get("used")  # expecting True/False/None
+
+    # brand exact match gets high points
+    if brand and brand in title:
+        score += 40
+    # item match
+    if item and item in title:
+        score += 25
+    # color and size weaker points
+    if color and color in title:
+        score += 10
+    if size and size in title:
+        score += 10
+    # price closer to or below target increases score
     try:
-        data = request.get_json(force=True)
-    except Exception as e:
-        return jsonify({"status": "error", "reason": f"Invalid JSON: {e}"}), 400
+        price = prod.get("price")
+        if price is not None and price_max:
+            # if under max price add points proportionally
+            try:
+                price_val = float(price)
+                if price_val <= float(price_max):
+                    score += 20
+                    # cheaper is slightly better
+                    score += int(max(0, (float(price_max) - price_val) // 10))
+            except:
+                pass
+    except:
+        pass
+    # used preference
+    if used_filter is not None:
+        prod_used = prod.get("used")
+        if prod_used is False and used_filter is False:
+            score += 10
+        if prod_used is True and used_filter is True:
+            score += 10
+        # penalize mismatch
+        if prod_used is True and used_filter is False:
+            score -= 5
+        if prod_used is False and used_filter is True:
+            score -= 5
+    # prefer items with URL and title
+    if prod.get("url"):
+        score += 2
+    if prod.get("title"):
+        score += 1
+    return score
 
-    # Filtrera baserat på input
-    category = data.get("category", "")
-    brand = data.get("brand", "")
-    size = data.get("size", "")
-    color = data.get("color", "")
-    condition = data.get("condition", "")
-    min_price = float(data.get("min_price", 0))
-    max_price = float(data.get("max_price", 999999))
+# --- Coordinator: run scrapers concurrently and choose best product ---
+def find_best_across_sites(query, filters):
+    cache_key = f"{query}|{filters}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
 
-    # Bygg sökfråga
-    query = " ".join(filter(None, [brand, category, size, color, condition]))
-    query = normalize_query(query)
+    results = []
+    # run scrapers concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = []
+        for site_name, scraper_fn in sites:
+            futures.append(ex.submit(_call_scraper_safe, site_name, scraper_fn, query, filters))
+        for fut in concurrent.futures.as_completed(futures, timeout=30):
+            try:
+                site_results = fut.result()
+                if site_results:
+                    results.extend(site_results)
+            except Exception:
+                # ignore a failing site
+                continue
 
-    # Hämta från flera källor
-    all_results = fetch_vinted(query) + fetch_sellpy(query) + fetch_tradera(query) + fetch_plick(query)
+    # score each
+    best = None
+    best_score = -10**9
+    for prod in results:
+        try:
+            s = score_product(prod, filters)
+        except Exception:
+            s = 0
+        prod['_score'] = s
+        if s > best_score:
+            best_score = s
+            best = prod
 
-    # Filtrera bort onödiga priser
-    filtered = []
-    for item in all_results:
-        price = parse_price(item.get("price", ""))
-        if min_price <= price <= max_price:
-            filtered.append(item)
+    # If no results, return None
+    cache_set(cache_key, best)
+    return best
 
-    best = rank_results(filtered or all_results, query)
+def _call_scraper_safe(site_name, fn, query, filters):
+    try:
+        return fn(query, filters)
+    except Exception:
+        return []
 
+# --- Flask endpoints ---
+@app.route("/")
+def home():
+    return jsonify({"message":"ClothesFinder API is running", "routes": {"/find_item":"POST"}})
+
+@app.route("/find_item", methods=["POST"])
+def find_item_route():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error":"No JSON payload provided"}), 400
+
+    # Accept flexible payload: either a single "query" or detailed filters
+    query = data.get("query", "")
+    filters = {
+        "brand": data.get("brand"),
+        "item": data.get("item"),
+        "size": data.get("size"),
+        "color": data.get("color"),
+        "price_max": data.get("price_max"),
+        "used": data.get("used")  # True/False/None
+    }
+
+    # If query empty, build from brand+item
+    if not query:
+        parts = []
+        if filters.get("brand"): parts.append(filters["brand"])
+        if filters.get("item"): parts.append(filters["item"])
+        query = " ".join(parts)
+
+    if not query:
+        return jsonify({"error":"No query or filters provided"}), 400
+
+    best = find_best_across_sites(query, filters)
     if not best:
-        return jsonify({
-            "status": "no_results",
-            "query": query,
-            "best": {},
-            "results": []
-        })
+        return jsonify({"link": None, "message":"Ingen produkt hittades"}), 404
 
-    return jsonify({
-        "status": "success",
-        "query": query,
-        "best": best,
-        "results_count": len(filtered or all_results)
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
+    # Build short response
+    resp = {
+        "site": best.get("site"),
+        "title": best.get("title"),
+        "price": best.get("price"),
+        "url": best.get("url"),
+        "score": best.get("_score", 0)
+    }
+    return jsonify({"best_match": resp})
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Bind to 0.0.0.0 so Render can detect the port
+    app.run(host="0.0.0.0", port=10000)
