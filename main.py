@@ -1,10 +1,10 @@
 # main.py
-# ClothesFinder — robust single-file backend
-# - Full product page scraping for price extraction
-# - Synonym and size handling (including jeans sizes)
-# - Scoring 0-100 with price rules: <=price_max => +10; >price_max => proportionally less
-# - Sites: Vinted, Sellpy, Tradera, Blocket, Plick, Facebook Marketplace
-# - Return best_match + top_results
+# ClothesFinder — robust single-file backend (revamped)
+# - Full-page price extraction
+# - Tolerant synonym matching and size handling (including jeans)
+# - Multiple secondhand sites (Vinted, Sellpy, Tradera, Blocket, Plick, Facebook)
+# - Returns best_match + top_results with breakdowns
+# - Defensive: won't die on single-site failures; prints logs for debugging
 
 from flask import Flask, request, jsonify
 import requests, re, time, threading
@@ -15,33 +15,33 @@ from urllib.parse import urljoin, quote_plus
 app = Flask(__name__)
 
 # ---------------- CONFIG ----------------
-USER_AGENT = "Mozilla/5.0 (compatible; ClothesFinder/4.1; +https://example.com)"
+USER_AGENT = "Mozilla/5.0 (compatible; ClothesFinder/5.0; +https://example.com)"
 REQUEST_TIMEOUT = 10
-MAX_WORKERS = 8
-PRODUCT_PAGE_WORKERS = 12
-CACHE_TTL = 300  # seconds
-TOP_PER_SITE = 8  # how many listings per site to fetch product pages for
+MAX_SCRAPER_WORKERS = 6
+MAX_PRODUCT_FETCH_WORKERS = 10
+CACHE_TTL = 300
+TOP_PER_SITE = 8          # how many listings to collect per site before fetching product pages
+TOP_RETURN = 6            # how many top results to return to client
+DEBUG_MODE = False        # set True to return more debug info (full_text) - careful with privacy/size
 
-# ---------------- SIMPLE CACHE ----------------
+# ---------------- CACHE ----------------
 _cache = {}
 _cache_lock = threading.Lock()
-
-def cache_get(key):
+def cache_get(k):
     with _cache_lock:
-        item = _cache.get(key)
-        if not item:
+        v = _cache.get(k)
+        if not v:
             return None
-        ts, val = item
+        ts, val = v
         if time.time() - ts > CACHE_TTL:
-            del _cache[key]
+            del _cache[k]
             return None
         return val
-
-def cache_set(key, val):
+def cache_set(k, val):
     with _cache_lock:
-        _cache[key] = (time.time(), val)
+        _cache[k] = (time.time(), val)
 
-# ---------------- UTILITIES ----------------
+# ---------------- UTIL ----------------
 HEADERS = {"User-Agent": USER_AGENT}
 
 def http_get(url, params=None):
@@ -49,7 +49,8 @@ def http_get(url, params=None):
         r = requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return r.text
-    except Exception:
+    except Exception as e:
+        print(f"[http_get] FAILED {url} -> {e}")
         return None
 
 def clean_text(t):
@@ -57,159 +58,127 @@ def clean_text(t):
         return ""
     return re.sub(r'\s+', ' ', t).strip()
 
-def parse_boolean_input(v):
+def parse_bool(v):
     if isinstance(v, bool):
         return v
     if v is None:
         return None
     s = str(v).strip().lower()
-    if s in ("true", "ja", "yes", "1"):
+    if s in ("true","ja","yes","1"):
         return True
-    if s in ("false", "nej", "no", "0"):
+    if s in ("false","nej","no","0"):
         return False
     return None
 
-# ---------------- SYNONYMS (expanded) ----------------
-# Add more terms over time. All lowercased comparisons are used.
+# ---------------- SYNONYMS (expanded but editable) ----------------
+# All comparisons are done case-insensitively on cleaned text.
 SYNONYMS = {
     # items
-    "byxor": ["byxa","byxor","pants","träningsbyxor","joggers","mjukisbyxor","mysbyxor"],
+    "byxor": ["byxa","byxor","pants","träningsbyxor","joggers","mjukisbyxor","mysbyxor","träningsbyxa"],
     "jeans": ["jeans","denim","jeansen","levis","501"],
     "hoodie": ["hoodie","luvtröja","hoodtröja","zip hoodie","hoodie med dragkedja","hood med dragkedja"],
     "tröja": ["tröja","tröjor","pullover","sweater","överdel","top"],
     "t-shirt": ["t-shirt","tshirt","tee","kortärmad tröja","t shirt"],
     "jacka": ["jacka","jackor","coat","puffer","bomber","anorak","windbreaker"],
-
     # styles
     "baggy": ["baggy","loose","oversized","wide"],
     "skinny": ["skinny","tight","slim","slimfit"],
-    "träning": ["träning","tränings","sport","gym","athletic","track","training"],
+    "training": ["träning","tränings","sport","gym","athletic","track","training"],
     "mjukis": ["mjukis","mys","lounge","casual","soft","relax"],
     "utomhus": ["utomhus","outdoor","friluft","vandrings","hiking"],
     "luvtröja": ["luvtröja","hoodie med dragkedja","zip hoodie"],
-
-    # colors (add variations)
+    # colors
     "svart": ["svart","svarta","black","dark","mörk"],
     "vit": ["vit","vita","white","offwhite","ljus"],
     "blå": ["blå","blåa","blue","navy","denim"],
     "grå": ["grå","gråa","gray","grey","ljusgrå"],
-    "beige": ["beige","sand","cream","offwhite"],
-    "röd": ["röd","röda","red","rosa"],
-    "grön": ["grön","gröna","green","oliv","khaki"],
-
-    # brand common mistakes / short forms can be added dynamically
-    "adidas": ["adidas","adidass","addiadas"],
-    "nike": ["nike","nikE","nikke"],
-    "levi": ["levi","levis","levi's"],
-
     # gender
     "herr": ["herr","man","men","male"],
     "dam": ["dam","kvinna","women","female"],
     "unisex": ["unisex","både","alla"],
-
     # kids
-    "barn": ["barn","kids","junior","pojke","flicka","child","baby","youth"]
+    "barn": ["barn","kids","junior","pojke","flicka","child","baby","youth"],
+    # brands (examples, add more as needed)
+    "adidas": ["adidas"],
+    "nike": ["nike"],
+    "levi": ["levi","levis","levi's"]
 }
 
-def text_contains_term(title, term):
-    """Check if title contains term or any synonyms (case-insensitive)."""
+def term_in_text(text, term):
+    """Return True if term or any synonyms appear in text."""
     if not term:
         return False
-    t = clean_text(title).lower()
-    term = term.lower()
-    if term in t:
+    t = clean_text(text).lower()
+    term_key = term.lower()
+    # direct
+    if term_key in t:
         return True
-    alts = SYNONYMS.get(term, [])
+    # synonyms
+    alts = SYNONYMS.get(term_key, [])
     for a in alts:
         if a in t:
             return True
-    # also check single-word fuzzy-ish: exact token matching for small misspellings
-    # (simple approach: word boundaries)
+    # sometimes user input equals a synonym key; check reverse mapping
+    # check all keys where given term appears in synonyms
+    for k, vals in SYNONYMS.items():
+        if term_key in vals and k in t:
+            return True
     return False
 
-# ---------------- SIZE HANDLING ----------------
-# Jeans parsing and mapping waist->text size (heuristic)
-def parse_jeans_size_from_text(text):
-    """
-    Find patterns like 'W32 L30', '32/30', '32x30', '32 30' and return (waist,int) or None.
-    """
+# ---------------- SIZE / JEANS LOGIC ----------------
+def parse_jeans(text):
+    """Find waist/length patterns in text. Return dict or None."""
     if not text:
         return None
     t = text.lower()
-    # common patterns: w32 l30
-    m = re.search(r'w\s?(\d{2,3})\s*[l|:x\/\s]\s*(\d{2,3})', t)
+    # W32 L30 or W 32 L 30
+    m = re.search(r'w\s?(\d{2})\s*[^\d]{1,3}\s*l\s?(\d{2})', t)
     if m:
-        try:
-            waist = int(m.group(1))
-            length = int(m.group(2))
-            return {"waist": waist, "length": length}
-        except:
-            pass
-    # patterns 32/30 or 32x30 or 32 30
-    m2 = re.search(r'\b(\d{2})\s*[/x\s]\s*(\d{2})\b', t)
+        return {"waist": int(m.group(1)), "length": int(m.group(2))}
+    # 32/30 or 32x30 or 32 30 (common)
+    m2 = re.search(r'\b(\d{2})\s*[\/x ]\s*(\d{2})\b', t)
     if m2:
-        try:
-            waist = int(m2.group(1))
-            length = int(m2.group(2))
-            return {"waist": waist, "length": length}
-        except:
-            pass
-    # single waist number maybe
-    m3 = re.search(r'\b(\d{2})\b', t)
+        return {"waist": int(m2.group(1)), "length": int(m2.group(2))}
+    # single waist number
+    m3 = re.search(r'\b(2[6-9]|3[0-9]|4[0-4])\b', t)  # waist plausible range 26-44
     if m3:
-        try:
-            v = int(m3.group(1))
-            if 26 <= v <= 44:
-                return {"waist": v, "length": None}
-        except:
-            pass
+        return {"waist": int(m3.group(1)), "length": None}
     return None
 
-def waist_to_text_size(waist):
-    # heuristic mapping
+def waist_to_size(waist):
     try:
         w = int(waist)
     except:
         return None
-    if w <= 28:
-        return "XS"
-    if w <= 30:
-        return "S"
-    if w <= 32:
-        return "M"
-    if w <= 34:
-        return "L"
-    if w <= 36:
-        return "XL"
+    if w <= 28: return "XS"
+    if w <= 30: return "S"
+    if w <= 32: return "M"
+    if w <= 34: return "L"
+    if w <= 36: return "XL"
     return "XXL"
 
-def is_kids_size_in_text(text):
+def detect_kids_by_size_or_text(text):
+    """Return True if text contains kid numeric sizes or explicit kids words."""
     if not text:
         return False
-    t = clean_text(text)
-    # look for numeric child sizes like 92,98,...170
-    if re.search(r'\b(9[0-9]|1[0-7][0-9])\b', t):
-        # e.g. 92-179 — treat 92..170 as kids (approx)
+    t = clean_text(text).lower()
+    # numeric child sizes (e.g. 92,98,...170)
+    if re.search(r'\b(9[0-9]|1[0-6][0-9]|170)\b', t):  # 90-170 roughly
         return True
-    if any(k in t for k in ["barn","kids","junior","pojke","flicka","baby"]):
+    if any(k in t for k in SYNONYMS.get("barn", [])):
         return True
     return False
 
 # ---------------- PRICE EXTRACTION ----------------
-def parse_price_from_html(html_text):
-    """
-    Extract price(s) from a full HTML page/text.
-    Returns smallest detected price (float) or None.
-    Matches patterns like '1 299 kr', '1299:-', '1299 kr', '1299'
-    but prefers those followed by 'kr' or ':-' when possible.
-    """
+def parse_price_from_page(html_text):
+    """Return smallest found price or None. Looks for 'kr', ':-', 'sek', or 3-5 digit numbers as fallback."""
     if not html_text:
         return None
     text = clean_text(html_text)
-    # first find explicit patterns with currency markers
-    pattern_currency = re.findall(r'(\d[\d\s\.,]*\d)\s*(kr|:-|sek)\b', text, flags=re.IGNORECASE)
+    # look for currency markers
+    matches = re.findall(r'(\d[\d\s\.,]*\d)\s*(kr|:-|sek)\b', text, flags=re.IGNORECASE)
     nums = []
-    for m in pattern_currency:
+    for m in matches:
         raw = m[0]
         n = re.sub(r'[^\d]', '', raw)
         if n:
@@ -219,10 +188,10 @@ def parse_price_from_html(html_text):
                 pass
     if nums:
         return min(nums)
-    # fallback: any standalone 3-5 digit number (but riskier)
-    pattern_nums = re.findall(r'\b(\d{3,5})\b', text)
+    # fallback: any 3-5 digit numbers (be careful)
+    fallback = re.findall(r'\b(\d{3,5})\b', text)
     nums2 = []
-    for n in pattern_nums:
+    for n in fallback:
         try:
             nums2.append(float(n))
         except:
@@ -231,9 +200,9 @@ def parse_price_from_html(html_text):
         return min(nums2)
     return None
 
-# ---------------- SCRAPERS (site-level: return list of candidate dicts) ----------------
-# Each candidate dict: {site, title, url, price (may be None), snippet (opt)}
-# For each listing we will later fetch the product page to parse price and full text.
+# ---------------- SCRAPERS ----------------
+# Each scraper returns a list of candidate dicts: {site,title,url, snippet(optional)}
+# We intentionally keep list of candidates small (TOP_PER_SITE) to limit requests.
 
 def scrape_vinted(query, filters):
     out = []
@@ -256,11 +225,11 @@ def scrape_vinted(query, filters):
             continue
         seen.add(url_full)
         title = clean_text(a.get_text() or a.get("title") or "")
-        out.append({"site":"Vinted", "title": title, "url": url_full, "price": None})
+        out.append({"site":"Vinted","title":title,"url":url_full})
     return out
 
 def scrape_tradera(query, filters):
-    out=[]
+    out = []
     q = quote_plus(query)
     url = f"https://www.tradera.com/search?q={q}"
     html = http_get(url)
@@ -278,41 +247,42 @@ def scrape_tradera(query, filters):
         if url_full in seen: continue
         seen.add(url_full)
         title = clean_text(a.get_text() or a.get("title") or "")
-        out.append({"site":"Tradera","title":title,"url":url_full,"price":None})
+        out.append({"site":"Tradera","title":title,"url":url_full})
     return out
 
 def scrape_generic(query, filters, base, contains=None, site_name=None):
     out=[]
     q = quote_plus(query)
-    # some bases already include ?q=..., others need different format; we try both patterns
-    url1 = base if "?" in base else (base + q)
+    # try both patterns: base?q= and base+q
+    url1 = base if "?" in base else (base + "?q=" + q)
     html = http_get(url1)
     if not html:
-        # try adding ?q=
-        url2 = base + "?q=" + q if "?" not in base else base
-        html = http_get(url2)
+        html = http_get(base + q)
         if not html:
             return out
     soup = BeautifulSoup(html, "html.parser")
-    anchors = soup.find_all("a", href=True)[:TOP_PER_SITE*2]
+    anchors = soup.find_all("a", href=True)[:TOP_PER_SITE * 3]
     seen=set()
     for a in anchors:
-        href=a.get("href")
-        if not href: continue
-        if contains and contains not in href: 
+        href = a.get("href")
+        if not href:
+            continue
+        if contains and contains not in href:
             # still allow if contains is None
             continue
         url_full = urljoin(base, href) if not href.startswith("http") else href
-        if url_full in seen: continue
+        if url_full in seen:
+            continue
         seen.add(url_full)
         title = clean_text(a.get_text() or a.get("title") or "")
         if not title:
-            # sometimes the link has nested text in children
-            title = clean_text(' '.join([c.get_text() for c in a.find_all(text=True)]))
-        out.append({"site": site_name or base.split("//")[-1].split("/")[0], "title": title, "url": url_full, "price": None})
+            # fallback: combine text of children
+            title = clean_text(' '.join([c.strip() for c in a.find_all(text=True)]))
+        if title:
+            out.append({"site": site_name or base.split("//")[-1].split("/")[0], "title": title, "url": url_full})
     return out
 
-# wrapper list of scrapers to call
+# Define SCRAPERS mapping (name, function)
 SCRAPERS = [
     ("Vinted", scrape_vinted),
     ("Sellpy", lambda q,f: scrape_generic(q,f,"https://www.sellpy.se/sok/","/product/","Sellpy")),
@@ -322,55 +292,47 @@ SCRAPERS = [
     ("Facebook", lambda q,f: scrape_generic(q,f,"https://m.facebook.com/marketplace/search/","/marketplace/item/","Facebook Marketplace")),
 ]
 
-# ---------------- PRODUCT PAGE FETCH (get full text + price + maybe size) ----------------
-def enrich_product_with_page_info(prod):
-    """
-    Given a product dict with 'url' and 'title', fetch its page and attempt to:
-    - extract price (smallest detected in page)
-    - extract full text (title + description)
-    - detect jeans size if present
-    - return updated dict
-    """
+# ---------------- PRODUCT PAGE ENRICH ----------------
+def enrich_product(prod):
+    """Fetch product url page, extract full text and page price and parse jeans sizes etc."""
     url = prod.get("url")
-    if not url:
-        prod["_full_text"] = prod.get("title","")
-        prod["_page_price"] = prod.get("price")
-        return prod
-    html = http_get(url)
-    if not html:
-        prod["_full_text"] = prod.get("title","")
-        prod["_page_price"] = prod.get("price")
-        return prod
-    full_text = clean_text(' '.join([prod.get("title",""), BeautifulSoup(html, "html.parser").get_text(separator=' ')]))
-    prod["_full_text"] = full_text
-    price = parse_price_from_html(full_text)
-    prod["_page_price"] = price if price is not None else prod.get("price")
-    # detect sizes / jeans
-    jeans = parse_jeans_size_from_text(full_text)
-    if jeans:
-        prod["_jeans"] = jeans
-        if jeans.get("waist"):
-            prod["_inferred_text_size"] = waist_to_text_size(jeans["waist"])
-    else:
-        # try to find single size tokens like "M", "L", "164"
-        # find tokens
-        toks = re.findall(r'\b[a-zA-Z]{1,3}\b|\b\d{2,3}\b', full_text)
-        toks = [t.strip() for t in toks if t.strip()]
-        # detect M/L/XS style tokens
-        for t in toks:
-            if t.lower() in ("xs","s","m","l","xl","xxl"):
-                prod["_inferred_text_size"] = t.upper()
-                break
-        # detect child numeric
-        if not prod.get("_inferred_text_size"):
-            for t in toks:
-                if re.match(r'^[89]\d$|^1[0-7]\d$', t):  # 80-179 range
-                    prod["_inferred_child_size"] = int(t)
-                    break
+    title = prod.get("title","")
+    prod["_full_text"] = title
+    prod["_page_price"] = None
+    prod["_jeans"] = None
+    prod["_inferred_size"] = None
+    try:
+        if not url:
+            return prod
+        html = http_get(url)
+        if not html:
+            return prod
+        soup = BeautifulSoup(html, "html.parser")
+        text = title + " " + soup.get_text(separator=' ')
+        text = clean_text(text)
+        prod["_full_text"] = text
+        price = parse_price_from_page(text)
+        prod["_page_price"] = price
+        jeans = parse_jeans(text)
+        if jeans:
+            prod["_jeans"] = jeans
+            if jeans.get("waist"):
+                prod["_inferred_size"] = waist_to_size(jeans["waist"])
+        else:
+            # try to detect token M/L/XS etc
+            tokens = re.findall(r'\b(xs|s|m|l|xl|xxl)\b', text, flags=re.IGNORECASE)
+            if tokens:
+                prod["_inferred_size"] = tokens[0].upper()
+            else:
+                # detect numeric child size
+                m = re.search(r'\b(9[0-9]|1[0-6][0-9])\b', text)
+                if m:
+                    prod["_inferred_child_size"] = int(m.group(1))
+    except Exception as e:
+        print(f"[enrich_product] error for {prod.get('url')} -> {e}")
     return prod
 
 # ---------------- SCORING ----------------
-# weights
 WEIGHTS = {
     "item": 30,
     "brand": 20,
@@ -379,262 +341,250 @@ WEIGHTS = {
     "kids": 15,
     "color": 5,
     "size": 10,
-    "price": 10  # max price bonus
+    "price": 10
 }
 
-def compute_price_score(page_price, price_max):
-    """Return 0..WEIGHTS['price'] """
-    if price_max is None:
+def price_points(page_price, price_max):
+    """Return 0..WEIGHTS['price']"""
+    if price_max is None or page_price is None:
         return 0
     try:
         pm = float(price_max)
-    except:
-        return 0
-    if page_price is None:
-        return 0
-    try:
         p = float(page_price)
     except:
         return 0
     if p <= pm:
-        return WEIGHTS["price"]  # full points when under or equal
-    # over price: linear decrease; if double the price -> zero
-    diff = p - pm
-    ratio = diff / pm  # e.g. 0.5 = 50% over
+        return WEIGHTS["price"]
+    # proportionally scale down: if p >= 2*pm -> 0
+    ratio = (p - pm) / pm
     score = WEIGHTS["price"] * max(0.0, 1.0 - ratio)
-    return max(0, round(score, 2))
+    return round(score, 2)
 
-def score_product(prod, filters):
+def score_one(prod, filters, strict_kids=True):
     """
-    Return tuple (score_float, breakdown_dict).
-    If veto (e.g. kids mismatch) -> return (0, breakdown) or negative large sentinel -> filtered out.
+    Returns (score_float, breakdown dict).
+    strict_kids: if True enforce veto for kids mismatch; if False allow partial matches (for debugging)
     """
     breakdown = {}
-    full_text = prod.get("_full_text") or prod.get("title","")
-    t = full_text.lower()
+    full = (prod.get("_full_text") or prod.get("title","")).lower()
     score = 0.0
 
-    # item (veto if missing)
+    # item (veto if not found)
     item = (filters.get("item") or "").strip()
     if item:
-        item_match = text_contains_term(t, item)
-        breakdown["item_match"] = bool(item_match)
-        if not item_match:
-            # item is veto (must match)
-            breakdown["veto"] = "item_mismatch"
-            return (0.0, breakdown)
+        item_found = term_in_text(full, item)
+        breakdown["item_found"] = bool(item_found)
+        if not item_found:
+            # try fuzzy token presence: check tokens intersection between item and full text
+            # split item into tokens and check if any synonym appears
+            found_any = False
+            for token in re.findall(r'\w+', item.lower()):
+                if term_in_text(full, token):
+                    found_any = True
+                    break
+            if not found_any:
+                breakdown["veto"] = "item_missing"
+                return (0.0, breakdown)
         score += WEIGHTS["item"]
     else:
-        breakdown["item_match"] = False
+        breakdown["item_found"] = False
 
     # brand
     brand = (filters.get("brand") or "").strip()
     if brand:
-        bmatch = text_contains_term(t, brand)
-        breakdown["brand_match"] = bool(bmatch)
-        if bmatch:
+        if term_in_text(full, brand):
             score += WEIGHTS["brand"]
-    else:
-        breakdown["brand_match"] = False
+            breakdown["brand"] = True
+        else:
+            breakdown["brand"] = False
 
     # style
     style = (filters.get("style") or "").strip()
     if style:
-        smatch = text_contains_term(t, style)
-        breakdown["style_match"] = bool(smatch)
-        if smatch:
+        if term_in_text(full, style):
             score += WEIGHTS["style"]
-    else:
-        breakdown["style_match"] = False
+            breakdown["style"] = True
+        else:
+            breakdown["style"] = False
 
-    # gender (veto logic: if user asks male/female and text explicitly opposite -> veto)
+    # gender
     gender = (filters.get("gender") or "").strip().lower()
     inferred_gender = None
-    if any(k in t for k in SYNONYMS.get("herr",[])):
+    if any(k in full for k in SYNONYMS.get("herr", [])):
         inferred_gender = "herr"
-    elif any(k in t for k in SYNONYMS.get("dam",[])):
+    elif any(k in full for k in SYNONYMS.get("dam", [])):
         inferred_gender = "dam"
-    # size-based inference: if inferred text size numeric suggests adult sizes -> consider adult
-    if not inferred_gender and prod.get("_inferred_text_size"):
-        inferred_gender = "herr/dam"
+    else:
+        inferred_gender = None
     breakdown["inferred_gender"] = inferred_gender
     if gender:
-        if inferred_gender and inferred_gender not in (gender, "herr/dam"):
+        if inferred_gender and inferred_gender != gender:
+            # if clearly opposite -> veto
             breakdown["veto"] = "gender_mismatch"
             return (0.0, breakdown)
-        # if no explicit, give gender points if word appears
-        if text_contains_term(t, gender):
+        # if explicit match in text -> full points, otherwise partial if inferred adult
+        if term_in_text(full, gender):
             score += WEIGHTS["gender"]
-            breakdown["gender_match"] = True
+            breakdown["gender"] = "explicit"
         else:
-            # if not explicit but inferred as adult ("herr/dam") we still give partial points
-            if inferred_gender == "herr/dam":
-                score += WEIGHTS["gender"] * 0.5
-                breakdown["gender_match"] = "inferred_partial"
+            if inferred_gender is None:
+                # maybe inferred via size
+                if prod.get("_inferred_size"):
+                    score += WEIGHTS["gender"] * 0.5
+                    breakdown["gender"] = "inferred_from_size_partial"
+                else:
+                    breakdown["gender"] = False
             else:
-                breakdown["gender_match"] = False
+                score += WEIGHTS["gender"] * 0.5
+                breakdown["gender"] = "inferred_partial"
 
-    # kids (veto logic)
-    kids_filter = parse_boolean_input(filters.get("kids"))
-    is_kid = is_kids_size_in_text(t) or ("barn" in t or "kids" in t or "junior" in t)
+    # kids detection + veto
+    kids_filter = parse_bool(filters.get("kids"))
+    is_kid = detect_kids_by_size_or_text(full)
     breakdown["is_kid_detected"] = bool(is_kid)
     if kids_filter is True:
         if not is_kid:
-            breakdown["veto"] = "expected_kids_but_not_kid"
-            return (0.0, breakdown)
-        else:
-            score += WEIGHTS["kids"]
+            if strict_kids:
+                breakdown["veto"] = "expected_child_but_not_detected"
+                return (0.0, breakdown)
+            else:
+                # allow but penalize
+                score -= 10
     elif kids_filter is False:
         if is_kid:
-            breakdown["veto"] = "expected_adult_but_is_kid"
-            return (0.0, breakdown)
+            if strict_kids:
+                breakdown["veto"] = "expected_adult_but_child_detected"
+                return (0.0, breakdown)
+            else:
+                score -= 10
         else:
-            score += WEIGHTS["kids"] * 0.5  # adult bonus
+            # adult bonus (partial)
+            score += WEIGHTS["kids"] * 0.5
 
     # color
     color = (filters.get("color") or "").strip()
     if color:
-        if text_contains_term(t, color):
+        if term_in_text(full, color):
             score += WEIGHTS["color"]
-            breakdown["color_match"] = True
+            breakdown["color"] = True
         else:
-            breakdown["color_match"] = False
+            breakdown["color"] = False
 
-    # size matching
+    # size matching (including jeans conversion)
     size_filter = (filters.get("size") or "").strip()
-    size_matched = False
-    # check direct text size matches and inferred sizes from jeans
+    matched_size = False
     if size_filter:
-        # normalize accepted forms: M, L, XS, or numeric jeans like 32 30
-        # check product inferred text size
-        inferred_text_size = prod.get("_inferred_text_size")
-        if inferred_text_size and inferred_text_size.lower() == size_filter.lower():
-            size_matched = True
-        else:
-            # check if jeans waist maps to text
-            jeans = prod.get("_jeans")
-            if jeans and jeans.get("waist"):
-                txt = waist_to_text_size(jeans["waist"])
-                if txt and txt.lower() == size_filter.lower():
-                    size_matched = True
-            # check presence of exact token (user might have given numeric)
-            if size_filter.isdigit() and size_filter in t:
-                size_matched = True
-            # check our size map tokens
-            if not size_matched:
-                for key, vals in SIZE_MAP.items():
-                    if size_filter.upper() == key:
-                        # look in text for any of vals
-                        for v in vals:
-                            if v in t:
-                                size_matched = True
-                                break
-                    if size_matched:
-                        break
-        if size_matched:
+        size_filter_norm = size_filter.lower()
+        # direct match with inferred size
+        if prod.get("_inferred_size") and prod["_inferred_size"].lower() == size_filter_norm:
+            matched_size = True
+        # check jeans waist mapping
+        if not matched_size and prod.get("_jeans") and prod["_jeans"].get("waist"):
+            ws = prod["_jeans"]["waist"]
+            if waist_to_size(ws).lower() == size_filter_norm:
+                matched_size = True
+        # direct token present (user may pass numeric 32 etc)
+        if not matched_size and re.search(r'\b' + re.escape(size_filter) + r'\b', full):
+            matched_size = True
+        if matched_size:
             score += WEIGHTS["size"]
-    breakdown["size_matched"] = bool(size_matched)
+    breakdown["size_matched"] = matched_size
 
-    # URL/title metadata bonus
-    if prod.get("url"):
-        score += 1
-    if prod.get("title"):
-        score += 1
-
-    # Price scoring (page price prioritized)
+    # page price points
     page_price = prod.get("_page_price")
-    price_pts = compute_price_score(page_price, filters.get("price_max"))
-    breakdown["price_points"] = price_pts
-    score += price_pts
+    pp = price_points(page_price, filters.get("price_max"))
+    breakdown["price_points"] = pp
+    score += pp
 
-    # clamp
+    # small metadata bonus
+    if prod.get("url"): score += 1
+    if prod.get("title"): score += 1
+
     final = max(0.0, min(100.0, round(score, 2)))
     breakdown["final"] = final
     return (final, breakdown)
 
-# ---------------- COORDINATOR: run scrapers, enrich pages, score ----------------
-def _safe_call(fn, query, filters):
-    try:
-        return fn(query, filters)
-    except Exception:
-        return []
+# ---------------- ORCHESTRATOR ----------------
+def run_scrapers(query, filters):
+    """Run all site scrapers concurrently and return combined candidate list."""
+    candidates = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_SCRAPER_WORKERS, len(SCRAPERS))) as ex:
+        futures = {ex.submit(fn, query, filters): name for (name, fn) in SCRAPERS}
+        for fut in concurrent.futures.as_completed(futures, timeout=30):
+            site = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                print(f"[run_scrapers] {site} scraper failed: {e}")
+                res = []
+            if res:
+                # each res element should be dict with title,url
+                candidates.extend(res)
+    return candidates
 
-def find_best_across_sites(query, filters, top_n=6):
-    """
-    1) Run site scrapers concurrently -> candidate lists
-    2) Limit to TOP_PER_SITE per site (already in scrapers)
-    3) Fetch product pages concurrently (enrich) for those candidates
-    4) Score each candidate
-    5) Return top_n sorted by (score desc, price asc)
-    """
-    cache_key = f"{query}|{str(filters)}"
+def enrich_candidates(candidates, max_workers=MAX_PRODUCT_FETCH_WORKERS):
+    """Fetch product pages concurrently to enrich candidates with _full_text and _page_price."""
+    enriched = []
+    # limit total product fetches to avoid huge loads
+    limit = min(len(candidates), TOP_PER_SITE * len(SCRAPERS))
+    candidates = candidates[:limit]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(enrich_product, c) for c in candidates]
+        for fut in concurrent.futures.as_completed(futures, timeout=60):
+            try:
+                enriched.append(fut.result())
+            except Exception as e:
+                print(f"[enrich_candidates] product fetch failed: {e}")
+    return enriched
+
+def find_best(query, filters, top_n=TOP_RETURN, strict_kids=True):
+    """Full pipeline: scrapers -> enrich -> score -> sort -> return top_n"""
+    cache_key = f"find|{query}|{str(filters)}"
     cached = cache_get(cache_key)
     if cached:
         return cached
 
-    candidates = []
-    # 1. run scrapers in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(SCRAPERS))) as ex:
-        futures = {ex.submit(_safe_call, fn, query, filters): name for (name, fn) in SCRAPERS}
-        for fut in concurrent.futures.as_completed(futures, timeout=30):
-            try:
-                res = fut.result()
-                if res:
-                    candidates.extend(res)
-            except Exception:
-                continue
-
+    candidates = run_scrapers(query, filters)
     if not candidates:
         cache_set(cache_key, [])
         return []
 
-    # 2. enrich product pages (fetch product page to get price + full text)
-    # limit concurrency and number of product pages to fetch overall to avoid timeouts
-    # We'll fetch up to TOP_PER_SITE per site already provided; cap total to a reasonable limit
-    # Use a thread pool to fetch product pages
-    with concurrent.futures.ThreadPoolExecutor(max_workers=PRODUCT_PAGE_WORKERS) as ex:
-        futures = [ex.submit(enrich_product_with_page_info, c) for c in candidates]
-        enriched = []
-        for fut in concurrent.futures.as_completed(futures, timeout=60):
-            try:
-                enriched.append(fut.result())
-            except Exception:
-                continue
-
-    # 3. score each
+    enriched = enrich_candidates(candidates)
     scored = []
     for p in enriched:
         try:
-            s, breakdown = score_product(p, filters)
-        except Exception:
-            s, breakdown = 0.0, {"final": 0}
-        p["_rating"] = s
+            sc, breakdown = score_one(p, filters, strict_kids=strict_kids)
+        except Exception as e:
+            print(f"[find_best] scoring failed for {p.get('url')} -> {e}")
+            sc, breakdown = 0.0, {"final": 0}
+        p["_rating"] = sc
         p["_breakdown"] = breakdown
-        # normalized price for tie-breaker
-        pp = p.get("_page_price")
+        # normalize price
         try:
-            p["_price_norm"] = float(pp) if pp is not None else None
+            p["_price_norm"] = float(p.get("_page_price")) if p.get("_page_price") is not None else None
         except:
             p["_price_norm"] = None
-        if s > 0:
-            scored.append(p)
+        scored.append(p)
 
-    if not scored:
-        cache_set(cache_key, [])
-        return []
+    # ensure we return useful alternatives: if everything vetoed to 0, still return top by fuzzy item match
+    filtered = [p for p in scored if p["_rating"] > 0]
+    if not filtered:
+        # fallback: select top 10 by fuzzy item token presence (not 0-rated veto)
+        scored.sort(key=lambda x: x["_rating"], reverse=True)
+        top = scored[:top_n]
+        cache_set(cache_key, top)
+        return top
 
-    # sort by rating desc, then price asc (None treated as very large)
-    def sort_key(x):
+    # sort by rating desc then price asc (None price -> INF)
+    def sortkey(x):
         price = x.get("_price_norm")
-        price_sort = float('inf') if price is None else price
-        return (-x.get("_rating",0), price_sort)
-
-    scored.sort(key=sort_key)
-    top = scored[:top_n]
+        return (-x.get("_rating",0), float('inf') if price is None else price)
+    filtered.sort(key=sortkey)
+    top = filtered[:top_n]
     cache_set(cache_key, top)
     return top
 
-# ---------------- FLASK ROUTES ----------------
+# ---------------- ROUTES ----------------
 @app.route("/")
 def home():
     return jsonify({"status":"ok","message":"ClothesFinder running"})
@@ -645,38 +595,52 @@ def find_item_route():
     if not data:
         return jsonify({"error":"No JSON payload provided"}), 400
 
-    # parse filters from Adalo; Adalo likely sends strings for booleans so convert
+    # read inputs (Adalo usually sends strings)
     brand = data.get("brand")
     item = data.get("item")
     color = data.get("color")
     style = data.get("style")
-    size = data.get("size")
     gender = data.get("gender")
-    kids = parse_boolean_input(data.get("kids"))
+    kids = parse_bool(data.get("kids"))
+    size = data.get("size")
     price_max = data.get("price_max")
-    query = data.get("query") or " ".join([str(x) for x in (brand, item, color, style) if x])
+    # try to convert price_max to float if possible
+    try:
+        if price_max is not None and price_max != "":
+            price_max = float(price_max)
+        else:
+            price_max = None
+    except:
+        price_max = None
+
+    # build query (used by scrapers)
+    if data.get("query"):
+        query = data.get("query")
+    else:
+        parts = [p for p in [brand, item, color, style] if p]
+        query = " ".join(parts)
 
     filters = {
         "brand": brand,
         "item": item,
         "color": color,
         "style": style,
-        "size": size,
         "gender": gender,
         "kids": kids,
+        "size": size,
         "price_max": price_max
     }
 
     if not query:
         return jsonify({"error":"No query or filters provided"}), 400
 
-    top = find_best_across_sites(query, filters, top_n=6)
-    if not top:
-        return jsonify({"best_match": None, "top_results": [], "message":"Inget resultat hittades"}), 404
+    # run pipeline; if DEBUG_MODE True, relax kids veto for easier debugging
+    strict_kids = not DEBUG_MODE
+    top = find_best(query, filters, top_n=TOP_RETURN, strict_kids=strict_kids)
 
-    # build response with breakdowns for debugging
+    # build response
     def fmt(p):
-        return {
+        out = {
             "site": p.get("site"),
             "title": p.get("title"),
             "url": p.get("url"),
@@ -684,6 +648,19 @@ def find_item_route():
             "rating": p.get("_rating"),
             "breakdown": p.get("_breakdown")
         }
+        if DEBUG_MODE:
+            out["_full_text"] = p.get("_full_text")
+            out["_jeans"] = p.get("_jeans")
+            out["_inferred_size"] = p.get("_inferred_size")
+        return out
+
+    if not top:
+        # no matches - return helpful message and empty list (404 previously)
+        return jsonify({
+            "best_match": None,
+            "top_results": [],
+            "message": "Inget resultat hittades. Testa att bredda sökningen eller ta bort vissa filter."
+        }), 404
 
     return jsonify({
         "best_match": fmt(top[0]),
@@ -692,5 +669,4 @@ def find_item_route():
     })
 
 if __name__ == "__main__":
-    # Render typically expects port from env, but default to 10000 here
     app.run(host="0.0.0.0", port=10000)
